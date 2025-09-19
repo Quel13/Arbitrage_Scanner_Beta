@@ -68,5 +68,6 @@ CHAIN_ALIASES = {
     "POLYGON":"POLYGON","MATIC":"POLYGON",
 }
 def norm_chain(name: str) -> str:
-    if not name: return ""
+    if not name:
+        return ""
     return CHAIN_ALIASES.get(name.strip().upper(), name.strip().upper())

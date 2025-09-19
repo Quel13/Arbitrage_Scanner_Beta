@@ -1,5 +1,5 @@
 # main.py
-import argparse, asyncio, threading, queue
+import argparse, asyncio, threading, queue, time
 import pandas as pd
 
 try:
@@ -23,6 +23,9 @@ class DualWindows:
         self.win_log = tk.Toplevel(); self.win_log.title(f"{title_prefix} — LOG")
         self.txt = tk.Text(self.win_log, height=30, width=110); self.txt.pack(fill='both', expand=True)
 
+        self.max_log_lines = 400
+        self.trim_interval_ms = 60_000
+
         self.win_tab = tk.Toplevel(); self.win_tab.title(f"{title_prefix} — SCREENER")
         cols = ("PAR","EXC COMPRA","EXC VENTA","BENEFICIO (%)","VOLUMEN (USDT)",
                 "TIEMPO ACTIVO (s)","ENVÍO/DEPÓSITO","TAMAÑO ESTIMADO (USDT)")
@@ -33,6 +36,7 @@ class DualWindows:
         self.tree.pack(fill='both', expand=True)
 
         self.root.after(300, self._drain_logs)
+        self.root.after(self.trim_interval_ms, self._trim_log)
         self.latest_rows_keyed = {}
 
     def _drain_logs(self):
@@ -44,6 +48,17 @@ class DualWindows:
         except queue.Empty:
             pass
         self.root.after(300, self._drain_logs)
+
+    def _trim_log(self):
+        try:
+            end_index = self.txt.index('end-1c')
+            total_lines = int(end_index.split('.')[0]) if end_index else 0
+            if total_lines > self.max_log_lines:
+                cutoff = total_lines - self.max_log_lines + 1
+                self.txt.delete('1.0', f'{cutoff}.0')
+        except Exception:
+            pass
+        self.root.after(self.trim_interval_ms, self._trim_log)
 
     def update_table(self, opps: list):
         keyset = set()
@@ -131,7 +146,7 @@ async def main_async(args, ui: DualWindows | None = None):
 
         from .config import TAKER_FEES_BPS
         from .core import compute_opportunities
-        opps = compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps, chain_matrix)
+        opps = await compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps, chain_matrix)
 
         if ui is not None:
             ui.update_table(opps)
@@ -174,7 +189,6 @@ def run_with_gui(args):
             asyncio.run(main_async(args, ui))
         except Exception as e:
             qlog(f"[FATAL] {e}")
-    import threading
     th = threading.Thread(target=worker, daemon=True)
     th.start()
     ui.run()
