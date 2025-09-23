@@ -32,6 +32,9 @@ class DualWindows:
         self.max_log_lines = 400
         self.trim_interval_ms = 60_000
 
+        self.max_log_lines = 400
+        self.trim_interval_ms = 60_000
+
         self.win_tab = tk.Toplevel(); self.win_tab.title(f"{title_prefix} — SCREENER")
         cols = (
             "PAR",
