@@ -1,5 +1,5 @@
 # config.py
-DEFAULT_EXCHANGES = ["binance", "bitget", "bybit", "mexc"]
+DEFAULT_EXCHANGES = ["binance", "bitget", "bybit"]
 
 # Fees taker (basis points). Ajusta a tu cuenta/nivel.
 TAKER_FEES_BPS = {

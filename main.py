@@ -11,7 +11,13 @@ except Exception:
 
 from .config import DEFAULT_EXCHANGES, TAKER_FEES_BPS
 from .utils import qlog, log_queue
-from .io_exchanges import create_exchange, load_markets_safe, fetch_tickers_safe
+from .io_exchanges import (
+    initialize_data_hub,
+    shutdown_data_hub,
+    create_exchange,
+    load_markets_safe,
+    fetch_tickers_safe,
+)
 from .core import rank_pairs_for_exchange, compute_opportunities
 
 # -------- GUI (dos ventanas) --------
@@ -22,6 +28,9 @@ class DualWindows:
 
         self.win_log = tk.Toplevel(); self.win_log.title(f"{title_prefix} — LOG")
         self.txt = tk.Text(self.win_log, height=30, width=110); self.txt.pack(fill='both', expand=True)
+
+        self.max_log_lines = 400
+        self.trim_interval_ms = 60_000
 
         self.max_log_lines = 400
         self.trim_interval_ms = 60_000
@@ -145,35 +154,42 @@ async def main_async(args, ui: DualWindows | None = None):
     qlog(f"Top-K por exchange: {topk} | min_qv: {min_qv} | max_spread_bps: {max_spread_bps}")
     qlog(f"Filtros: min_net_bps: {min_net_bps} | slippage_bps: {slippage_bps}")
 
-    while True:
-        t0 = time.time()
-        qlog("===== NUEVA PASADA =====")
-        ranked = await build_snapshot(exchanges, quotes, topk, min_qv, max_spread_bps)
-        if not ranked:
-            qlog("Sin candidatos tras ranking. Revisa filtros o conectividad.")
+    loop = asyncio.get_running_loop()
+    await initialize_data_hub(loop, exchanges, quotes)
+
+    try:
+        while True:
+            t0 = time.time()
+            qlog("===== NUEVA PASADA =====")
+            ranked = await build_snapshot(exchanges, quotes, topk, min_qv, max_spread_bps)
+            if not ranked:
+                qlog("Sin candidatos tras ranking. Revisa filtros o conectividad.")
+                if refresh <= 0: break
+                await asyncio.sleep(max(0, refresh)); continue
+
+            from .config import TAKER_FEES_BPS
+            from .core import compute_opportunities
+            opps = await compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps)
+
+            if ui is not None:
+                ui.update_table(opps)
+            else:
+                df_opp = pd.DataFrame(opps)
+                qlog("=== TOP OPORTUNIDADES (net_bps) ===")
+                qlog(df_opp.head(args.top_show).to_string(index=False) if not df_opp.empty else "No hay oportunidades que pasen el umbral.")
+
+            if args.save_csv:
+                from datetime import datetime
+                ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                pd.DataFrame(ranked).to_csv(f"ranked_{ts}.csv", index=False)
+                pd.DataFrame(opps).to_csv(f"opps_{ts}.csv", index=False)
+                qlog(f"Guardados: ranked_{ts}.csv, opps_{ts}.csv")
+
+            dt = time.time() - t0
             if refresh <= 0: break
-            await asyncio.sleep(max(0, refresh)); continue
-
-        from .config import TAKER_FEES_BPS
-        from .core import compute_opportunities
-        opps = await compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps)
-        if ui is not None:
-            ui.update_table(opps)
-        else:
-            df_opp = pd.DataFrame(opps)
-            qlog("=== TOP OPORTUNIDADES (net_bps) ===")
-            qlog(df_opp.head(args.top_show).to_string(index=False) if not df_opp.empty else "No hay oportunidades que pasen el umbral.")
-
-        if args.save_csv:
-            from datetime import datetime
-            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            pd.DataFrame(ranked).to_csv(f"ranked_{ts}.csv", index=False)
-            pd.DataFrame(opps).to_csv(f"opps_{ts}.csv", index=False)
-            qlog(f"Guardados: ranked_{ts}.csv, opps_{ts}.csv")
-
-        dt = time.time() - t0
-        if refresh <= 0: break
-        await asyncio.sleep(max(0.0, refresh - dt))
+            await asyncio.sleep(max(0.0, refresh - dt))
+    finally:
+        await shutdown_data_hub()
 
 # -------- CLI / arranque --------
 def parse_args():
