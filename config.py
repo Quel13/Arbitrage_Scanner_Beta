@@ -9,9 +9,3 @@ TAKER_FEES_BPS = {
 
 # Excluir tokens apalancados/raros que distorsionan el screener
 EXCLUDE_PATTERNS = ("3L", "3S", "5L", "5S", "BULL", "BEAR", "UP/", "DOWN/", "-UP/", "-DOWN/")
-
-# Endpoints verificación de redes (todos públicos)
-BITGET_COINS_URL   = "https://api.bitget.com/api/v2/spot/public/coins"
-BINANCE_CONFIG_URL = "https://www.binance.com/bapi/asset/v1/public/asset-service/product/get-product-list"
-BYBIT_COIN_INFO_URL = "https://api.bybit.com/v5/asset/coin/query-info"
-MEXC_CONFIG_URL     = "https://www.mexc.com/open/api/v2/market/coin/list"

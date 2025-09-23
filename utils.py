@@ -56,18 +56,3 @@ log_queue: "queue.Queue[str]" = queue.Queue()
 def qlog(msg: str):
     ts = datetime.utcnow().strftime('%H:%M:%S')
     log_queue.put(f"[{ts}] {msg}")
-
-# ---- normalización de cadenas (networks) ----
-CHAIN_ALIASES = {
-    "ERC20":"ETHEREUM","ETH":"ETHEREUM","ETHEREUM":"ETHEREUM",
-    "BSC":"BSC","BEP20":"BSC","BEP20(BSC)":"BSC",
-    "TRC20":"TRON","TRON":"TRON","TRX":"TRON",
-    "ARBITRUM":"ARBITRUM","ARB":"ARBITRUM",
-    "OPTIMISM":"OPTIMISM","OP":"OPTIMISM",
-    "SOL":"SOLANA","SOLANA":"SOLANA",
-    "POLYGON":"POLYGON","MATIC":"POLYGON",
-}
-def norm_chain(name: str) -> str:
-    if not name:
-        return ""
-    return CHAIN_ALIASES.get(name.strip().upper(), name.strip().upper())

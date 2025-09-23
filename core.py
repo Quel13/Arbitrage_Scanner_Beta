@@ -1,23 +1,19 @@
 # core.py
-import math, time, asyncio, aiohttp
+import math, time, asyncio
 
-from .config import (BITGET_COINS_URL, BINANCE_CONFIG_URL, BYBIT_COIN_INFO_URL,
-                     MEXC_CONFIG_URL)
-from .utils import (normalize_symbol, quote_of, compute_spread_bps, volume_quote_est,
-                    norm_chain, now_ts_ms, ts_iso, qlog)
+from .utils import (
+    normalize_symbol,
+    quote_of,
+    compute_spread_bps,
+    volume_quote_est,
+    now_ts_ms,
+    ts_iso,
+)
 from .io_exchanges import fetch_order_book_once
 
 
-def as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"true", "1", "yes", "enabled", "open"}
-
 # ---------- Ranking por exchange ----------
+
 def rank_pairs_for_exchange(exchange_id: str, tickers: dict, quotes: set,
                             topk: int = 100, min_qv: float = 5e5, max_spread_bps: float = 50.0):
     rows = []
@@ -40,130 +36,6 @@ def rank_pairs_for_exchange(exchange_id: str, tickers: dict, quotes: set,
         })
     rows.sort(key=lambda r: r['score'], reverse=True)
     return rows[:topk]
-
-# ---------- Verificación de redes (matriz) ----------
-async def bitget_coin_info(session: aiohttp.ClientSession):
-    try:
-        async with session.get(BITGET_COINS_URL, timeout=15) as r:
-            j = await r.json()
-            data = j.get('data') or []
-            out = {}
-            for item in data:
-                coin = (item.get('coin') or '').upper()
-                lst = []
-                for ch in (item.get('chains') or []):
-                    lst.append({
-                        'chain': norm_chain(ch.get('chain')),
-                        'deposit': as_bool(ch.get('rechargeable')),
-                        'withdraw': as_bool(ch.get('withdrawable')),
-                        'fee': ch.get('withdrawFee'), 'min': ch.get('minWithdrawAmount'),
-                        'raw': ch,
-                    })
-                out[coin] = lst
-            return out
-    except Exception as e:
-        qlog(f"[WARN] bitget coins error: {e}"); return {}
-
-async def binance_coin_info(session: aiohttp.ClientSession):
-    try:
-        async with session.post(BINANCE_CONFIG_URL, json={}, timeout=20) as r:
-            j = await r.json(content_type=None)
-            data = j.get('data') if isinstance(j, dict) else j
-            if data is None:
-                return {}
-            out = {}
-            for item in data:
-                coin = (item.get('coin') or item.get('asset') or '').upper()
-                if not coin:
-                    continue
-                nets = item.get('networkList') or item.get('supportNetworkList') or []
-                lst = []
-                for ch in nets:
-                    name = ch.get('network') or ch.get('name')
-                    lst.append({
-                        'chain': norm_chain(name),
-                        'deposit': as_bool(ch.get('depositEnable')),
-                        'withdraw': as_bool(ch.get('withdrawEnable')),
-                        'fee': ch.get('withdrawFee'), 'min': ch.get('withdrawMin'),
-                        'raw': ch,
-                    })
-                out[coin] = lst
-            return out
-    except Exception as e:
-        qlog(f"[WARN] binance config error: {e}"); return {}
-
-async def bybit_coin_info(session: aiohttp.ClientSession):
-    try:
-        async with session.get(BYBIT_COIN_INFO_URL, timeout=15) as r:
-            j = await r.json()
-            rows = (j.get('result') or {}).get('rows') or []
-            out = {}
-            for row in rows:
-                coin = (row.get('coin') or '').upper()
-                lst = []
-                for ch in (row.get('chains') or []):
-                    lst.append({
-                        'chain': norm_chain(ch.get('chain')),
-                        'deposit': as_bool(ch.get('chainDeposit')),
-                        'withdraw': as_bool(ch.get('chainWithdraw')),
-                        'fee': ch.get('withdrawFee'), 'min': ch.get('withdrawMin'),
-                        'raw': ch,
-                    })
-                out[coin] = lst
-            return out
-    except Exception as e:
-        qlog(f"[WARN] bybit coin info error: {e}"); return {}
-
-async def mexc_coin_info(session: aiohttp.ClientSession):
-    try:
-        async with session.get(MEXC_CONFIG_URL, timeout=20) as r:
-            j = await r.json(content_type=None)
-            data = j.get('data') if isinstance(j, dict) else j
-            if data is None:
-                return {}
-            out = {}
-            for item in data:
-                coin = (item.get('currency') or item.get('coin') or '').upper()
-                if not coin:
-                    continue
-                nets = (item.get('chains') or item.get('networkList') or
-                        item.get('networks') or [])
-                lst = []
-                for ch in nets:
-                    name = ch.get('chain') or ch.get('network') or ch.get('netWork')
-                    lst.append({
-                        'chain': norm_chain(name),
-                        'deposit': as_bool(ch.get('depositEnable') or ch.get('enableDeposit') or ch.get('isDepositEnabled') or ch.get('depositStatus')),
-                        'withdraw': as_bool(ch.get('withdrawEnable') or ch.get('enableWithdraw') or ch.get('isWithdrawEnabled') or ch.get('withdrawStatus')),
-                        'fee': ch.get('withdrawFee'), 'min': ch.get('withdrawMin') or ch.get('minWithdrawAmount'),
-                        'raw': ch,
-                    })
-                out[coin] = lst
-            return out
-    except Exception as e:
-        qlog(f"[WARN] mexc config error: {e}"); return {}
-
-async def fetch_chain_matrix(exchanges: list):
-    matrix = {ex: {} for ex in exchanges}
-    async with aiohttp.ClientSession() as session:
-        if 'bitget' in exchanges:  matrix['bitget']  = await bitget_coin_info(session)
-        if 'binance' in exchanges: matrix['binance'] = await binance_coin_info(session)
-        if 'bybit' in exchanges:   matrix['bybit']   = await bybit_coin_info(session)
-        if 'mexc' in exchanges:    matrix['mexc']    = await mexc_coin_info(session)
-    return matrix
-
-def pick_viable_chain(asset_base: str, src: str, dst: str, chain_matrix: dict):
-    asset = asset_base.upper()
-    src_map = chain_matrix.get(src.lower()) or {}
-    dst_map = chain_matrix.get(dst.lower()) or {}
-    if not src_map and not dst_map:
-        return "DESCONOCIDO", ""
-    src_wd = {it['chain'] for it in (src_map.get(asset, []) or []) if it.get('withdraw')}
-    dst_dp = {it['chain'] for it in (dst_map.get(asset, []) or []) if it.get('deposit')}
-    commons = src_wd.intersection(dst_dp)
-    if commons:
-        return "OK", sorted(list(commons))[0]
-    return "DESCONOCIDO", ""
 
 # ---------- Depth y tamaño ejecutable ----------
 def consume_depth(ob, side: str, price_cap: float, max_usdt: float = 1e9):
@@ -219,9 +91,14 @@ async def estimate_executable_usdt(symbol: str, buy_ex: str, sell_ex: str,
 _first_seen = {}  # (symbol, buy_ex, sell_ex) -> ts_ms
 
 
-async def compute_opportunities(ranked_rows, taker_fees_bps: dict, slippage_bps: float = 2.0,
-                                min_net_bps: float = 5.0, chain_matrix: dict | None = None,
-                                max_paths_per_symbol: int = 3):
+async def compute_opportunities(
+    ranked_rows,
+    taker_fees_bps: dict,
+    slippage_bps: float = 2.0,
+    min_net_bps: float = 5.0,
+    max_paths_per_symbol: int = 3,
+):
+
     by_symbol = {}
     for r in ranked_rows:
         by_symbol.setdefault(r['symbol'], []).append(r)
@@ -296,13 +173,6 @@ async def compute_opportunities(ranked_rows, taker_fees_bps: dict, slippage_bps:
                 est_size = 0.0
 
         active_sec = max(0, (now_ms - combo['first_ts']) // 1000)
-        base = combo['symbol'].split('/')[0]
-        chain_status, best_chain = ("DESCONOCIDO", "")
-        if chain_matrix is not None:
-            chain_status, best_chain = pick_viable_chain(
-                base, combo['buy']['exchange'], combo['sell']['exchange'], chain_matrix
-            )
-
         expected_usdt = est_size * combo['net_bps'] / 1e4
         volume_factor = math.log10(1.0 + max(est_size, 0.0) / 1000.0)
         edge_score = combo['net_bps'] * (1.0 + volume_factor)
@@ -311,13 +181,13 @@ async def compute_opportunities(ranked_rows, taker_fees_bps: dict, slippage_bps:
             'symbol': combo['symbol'],
             'buy_ex': combo['buy']['exchange'],
             'sell_ex': combo['sell']['exchange'],
+            'buy_price': combo['buy'].get('ask'),
+            'sell_price': combo['sell'].get('bid'),
             'gross_bps': combo['gross_bps'],
             'net_bps': combo['net_bps'],
             'buy_qv': combo['buy']['quote_volume'],
             'sell_qv': combo['sell']['quote_volume'],
             'active_sec': active_sec,
-            'chain_status': chain_status,
-            'best_chain': best_chain,
             'est_usdt': est_size,
             'expected_usdt': expected_usdt,
             'edge_score': edge_score,
