@@ -9,4 +9,3 @@ TAKER_FEES_BPS = {
 
 # Excluir tokens apalancados/raros que distorsionan el screener
 EXCLUDE_PATTERNS = ("3L", "3S", "5L", "5S", "BULL", "BEAR", "UP/", "DOWN/", "-UP/", "-DOWN/")
-

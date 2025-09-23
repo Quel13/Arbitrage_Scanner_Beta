@@ -13,6 +13,7 @@ from .io_exchanges import fetch_order_book_once
 
 
 # ---------- Ranking por exchange ----------
+
 def rank_pairs_for_exchange(exchange_id: str, tickers: dict, quotes: set,
                             topk: int = 100, min_qv: float = 5e5, max_spread_bps: float = 50.0):
     rows = []
@@ -97,6 +98,7 @@ async def compute_opportunities(
     min_net_bps: float = 5.0,
     max_paths_per_symbol: int = 3,
 ):
+
     by_symbol = {}
     for r in ranked_rows:
         by_symbol.setdefault(r['symbol'], []).append(r)

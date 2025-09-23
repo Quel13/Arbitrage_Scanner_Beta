@@ -56,4 +56,3 @@ log_queue: "queue.Queue[str]" = queue.Queue()
 def qlog(msg: str):
     ts = datetime.utcnow().strftime('%H:%M:%S')
     log_queue.put(f"[{ts}] {msg}")
-

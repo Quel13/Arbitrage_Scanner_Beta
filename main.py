@@ -157,7 +157,6 @@ async def main_async(args, ui: DualWindows | None = None):
         from .config import TAKER_FEES_BPS
         from .core import compute_opportunities
         opps = await compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps)
-
         if ui is not None:
             ui.update_table(opps)
         else:
