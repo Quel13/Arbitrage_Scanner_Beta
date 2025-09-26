@@ -4,7 +4,7 @@ from typing import Callable, Dict, List
 
 import aiohttp
 
-from ..utils import now_ts_ms, qlog
+from utils import now_ts_ms, qlog
 
 
 class ExchangeWS:

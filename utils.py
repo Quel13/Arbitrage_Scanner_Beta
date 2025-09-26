@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timezone
 import queue
 
-from .config import EXCLUDE_PATTERNS
+from config import EXCLUDE_PATTERNS
 
 # ---- tiempo / formato ----
 def now_ts_ms() -> int:
