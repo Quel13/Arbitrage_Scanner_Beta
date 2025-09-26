@@ -1,5 +1,8 @@
 # config.py
-DEFAULT_EXCHANGES = ["binance", "bitget", "bybit", "mexc"]
+DEFAULT_EXCHANGES = ["binance", "bitget", "bybit"]
+
+# Número máximo de pares totales a los que se abrirá websocket (top-M global).
+DEFAULT_WS_TOP = 200
 
 # Fees taker (basis points). Ajusta a tu cuenta/nivel.
 TAKER_FEES_BPS = {
@@ -10,8 +13,3 @@ TAKER_FEES_BPS = {
 # Excluir tokens apalancados/raros que distorsionan el screener
 EXCLUDE_PATTERNS = ("3L", "3S", "5L", "5S", "BULL", "BEAR", "UP/", "DOWN/", "-UP/", "-DOWN/")
 
-# Endpoints verificación de redes
-BITGET_COINS_URL  = "https://api.bitget.com/api/v2/spot/public/coins"
-BINANCE_CONFIG_URL = "https://api.binance.com/sapi/v1/capital/config/getall"  # requiere API key
-BYBIT_COIN_INFO_URL = "https://api.bybit.com/v5/asset/coin/query-info"
-MEXC_CONFIG_URL     = "https://api.mexc.com/api/v3/capital/config/getall"

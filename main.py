@@ -1,5 +1,5 @@
 # main.py
-import argparse, asyncio, threading, queue
+import argparse, asyncio, threading, queue, time
 import pandas as pd
 
 try:
@@ -9,10 +9,17 @@ except Exception:
     tk = None
     ttk = None
 
-from .config import DEFAULT_EXCHANGES, TAKER_FEES_BPS
+from .config import DEFAULT_EXCHANGES, DEFAULT_WS_TOP, TAKER_FEES_BPS
 from .utils import qlog, log_queue
-from .io_exchanges import create_exchange, load_markets_safe, fetch_tickers_safe
-from .core import rank_pairs_for_exchange, compute_opportunities, fetch_chain_matrix
+from .io_exchanges import (
+    initialize_data_hub,
+    shutdown_data_hub,
+    create_exchange,
+    load_markets_safe,
+    fetch_tickers_safe,
+    sync_rankings_with_ws,
+)
+from .core import rank_pairs_for_exchange, compute_opportunities
 
 # -------- GUI (dos ventanas) --------
 class DualWindows:
@@ -23,9 +30,21 @@ class DualWindows:
         self.win_log = tk.Toplevel(); self.win_log.title(f"{title_prefix} — LOG")
         self.txt = tk.Text(self.win_log, height=30, width=110); self.txt.pack(fill='both', expand=True)
 
+        self.max_log_lines = 400
+        self.trim_interval_ms = 60_000
+
         self.win_tab = tk.Toplevel(); self.win_tab.title(f"{title_prefix} — SCREENER")
-        cols = ("PAR","EXC COMPRA","EXC VENTA","BENEFICIO (%)","VOLUMEN (USDT)",
-                "TIEMPO ACTIVO (s)","ENVÍO/DEPÓSITO","TAMAÑO ESTIMADO (USDT)")
+        cols = (
+            "PAR",
+            "EXC COMPRA",
+            "EXC VENTA",
+            "BUY PRICE",
+            "SELL PRICE",
+            "BENEFICIO (%)",
+            "VOLUMEN (USDT)",
+            "TIEMPO ACTIVO (s)",
+            "TAMAÑO ESTIMADO (USDT)",
+        )
         self.tree = ttk.Treeview(self.win_tab, columns=cols, show='headings', height=20)
         for c in cols:
             self.tree.heading(c, text=c)
@@ -33,6 +52,7 @@ class DualWindows:
         self.tree.pack(fill='both', expand=True)
 
         self.root.after(300, self._drain_logs)
+        self.root.after(self.trim_interval_ms, self._trim_log)
         self.latest_rows_keyed = {}
 
     def _drain_logs(self):
@@ -45,17 +65,31 @@ class DualWindows:
             pass
         self.root.after(300, self._drain_logs)
 
+    def _trim_log(self):
+        try:
+            end_index = self.txt.index('end-1c')
+            total_lines = int(end_index.split('.')[0]) if end_index else 0
+            if total_lines > self.max_log_lines:
+                cutoff = total_lines - self.max_log_lines + 1
+                self.txt.delete('1.0', f'{cutoff}.0')
+        except Exception:
+            pass
+        self.root.after(self.trim_interval_ms, self._trim_log)
+
     def update_table(self, opps: list):
         keyset = set()
         for o in opps[:100]:
             key = (o['symbol'], o['buy_ex'], o['sell_ex'])
             keyset.add(key)
             values = (
-                o['symbol'], o['buy_ex'], o['sell_ex'],
+                o['symbol'],
+                o['buy_ex'],
+                o['sell_ex'],
+                f"{o.get('buy_price') or 0:.6f}",
+                f"{o.get('sell_price') or 0:.6f}",
                 f"{o['net_bps']/100:.4f}",
                 f"{int(o['buy_qv'] or 0):,}",
                 str(o['active_sec']),
-                f"{o['best_chain'] or '-'} ({o['chain_status']})",
                 f"{int(o.get('est_usdt') or 0):,}"
             )
             iid = self.latest_rows_keyed.get(key)
@@ -75,7 +109,8 @@ class DualWindows:
         self.root.mainloop()
 
 # -------- pipeline principal --------
-async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float, max_spread_bps: float):
+async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float,
+                         max_spread_bps: float):
     qlog("[INFO] Iniciando snapshot de mercados…")
     instances = {}
     for ex_id in exchanges:
@@ -100,7 +135,12 @@ async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float,
         finally:
             try: await ex.close()
             except Exception: pass
-    qlog("[INFO] Snapshot completado.")
+    if not ranked_all:
+        qlog("[INFO] Snapshot completado sin candidatos.")
+        return []
+
+    ranked_all = await sync_rankings_with_ws(ranked_all)
+    qlog(f"[INFO] Snapshot completado con {len(ranked_all)} filas tras datos en vivo.")
     return ranked_all
 
 async def main_async(args, ui: DualWindows | None = None):
@@ -118,38 +158,48 @@ async def main_async(args, ui: DualWindows | None = None):
     qlog(f"Top-K por exchange: {topk} | min_qv: {min_qv} | max_spread_bps: {max_spread_bps}")
     qlog(f"Filtros: min_net_bps: {min_net_bps} | slippage_bps: {slippage_bps}")
 
-    chain_matrix = await fetch_chain_matrix(exchanges)
+    loop = asyncio.get_running_loop()
+    await initialize_data_hub(loop, exchanges, quotes, args.ws_top)
 
-    while True:
-        t0 = time.time()
-        qlog("===== NUEVA PASADA =====")
-        ranked = await build_snapshot(exchanges, quotes, topk, min_qv, max_spread_bps)
-        if not ranked:
-            qlog("Sin candidatos tras ranking. Revisa filtros o conectividad.")
+    try:
+        while True:
+            t0 = time.time()
+            qlog("===== NUEVA PASADA =====")
+            ranked = await build_snapshot(
+                exchanges,
+                quotes,
+                topk,
+                min_qv,
+                max_spread_bps,
+            )
+            if not ranked:
+                qlog("Sin candidatos tras ranking. Revisa filtros o conectividad.")
+                if refresh <= 0: break
+                await asyncio.sleep(max(0, refresh)); continue
+
+            from .config import TAKER_FEES_BPS
+            from .core import compute_opportunities
+            opps = await compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps)
+
+            if ui is not None:
+                ui.update_table(opps)
+            else:
+                df_opp = pd.DataFrame(opps)
+                qlog("=== TOP OPORTUNIDADES (net_bps) ===")
+                qlog(df_opp.head(args.top_show).to_string(index=False) if not df_opp.empty else "No hay oportunidades que pasen el umbral.")
+
+            if args.save_csv:
+                from datetime import datetime
+                ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                pd.DataFrame(ranked).to_csv(f"ranked_{ts}.csv", index=False)
+                pd.DataFrame(opps).to_csv(f"opps_{ts}.csv", index=False)
+                qlog(f"Guardados: ranked_{ts}.csv, opps_{ts}.csv")
+
+            dt = time.time() - t0
             if refresh <= 0: break
-            await asyncio.sleep(max(0, refresh)); continue
-
-        from .config import TAKER_FEES_BPS
-        from .core import compute_opportunities
-        opps = compute_opportunities(ranked, TAKER_FEES_BPS, slippage_bps, min_net_bps, chain_matrix)
-
-        if ui is not None:
-            ui.update_table(opps)
-        else:
-            df_opp = pd.DataFrame(opps)
-            qlog("=== TOP OPORTUNIDADES (net_bps) ===")
-            qlog(df_opp.head(args.top_show).to_string(index=False) if not df_opp.empty else "No hay oportunidades que pasen el umbral.")
-
-        if args.save_csv:
-            from datetime import datetime
-            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            pd.DataFrame(ranked).to_csv(f"ranked_{ts}.csv", index=False)
-            pd.DataFrame(opps).to_csv(f"opps_{ts}.csv", index=False)
-            qlog(f"Guardados: ranked_{ts}.csv, opps_{ts}.csv")
-
-        dt = time.time() - t0
-        if refresh <= 0: break
-        await asyncio.sleep(max(0.0, refresh - dt))
+            await asyncio.sleep(max(0.0, refresh - dt))
+    finally:
+        await shutdown_data_hub()
 
 # -------- CLI / arranque --------
 def parse_args():
@@ -161,6 +211,8 @@ def parse_args():
     p.add_argument('--max-spread-bps', type=float, default=50.0, help='Spread máximo en bps')
     p.add_argument('--min-net-bps', type=float, default=5.0, help='Umbral de edge neto en bps')
     p.add_argument('--slippage-bps', type=float, default=2.0, help='Slippage estimado (bps)')
+    p.add_argument('--ws-top', type=int, default=DEFAULT_WS_TOP,
+                   help='Máximo de pares totales para abrir websockets (top-M global)')
     p.add_argument('--top-show', type=int, default=20, help='Filas a mostrar en modo texto')
     p.add_argument('--save-csv', action='store_true', help='Guardar CSV de ranked y opps')
     p.add_argument('--refresh', type=float, default=0.0, help='Segundos entre pasadas (0 = solo una)')
@@ -174,7 +226,6 @@ def run_with_gui(args):
             asyncio.run(main_async(args, ui))
         except Exception as e:
             qlog(f"[FATAL] {e}")
-    import threading
     th = threading.Thread(target=worker, daemon=True)
     th.start()
     ui.run()
