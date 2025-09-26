@@ -9,7 +9,7 @@ except Exception:
     tk = None
     ttk = None
 
-from .config import DEFAULT_EXCHANGES, TAKER_FEES_BPS
+from .config import DEFAULT_EXCHANGES, DEFAULT_WS_TOP, TAKER_FEES_BPS
 from .utils import qlog, log_queue
 from .io_exchanges import (
     initialize_data_hub,
@@ -17,6 +17,7 @@ from .io_exchanges import (
     create_exchange,
     load_markets_safe,
     fetch_tickers_safe,
+    sync_rankings_with_ws,
 )
 from .core import rank_pairs_for_exchange, compute_opportunities
 
@@ -28,6 +29,9 @@ class DualWindows:
 
         self.win_log = tk.Toplevel(); self.win_log.title(f"{title_prefix} — LOG")
         self.txt = tk.Text(self.win_log, height=30, width=110); self.txt.pack(fill='both', expand=True)
+
+        self.max_log_lines = 400
+        self.trim_interval_ms = 60_000
 
         self.max_log_lines = 400
         self.trim_interval_ms = 60_000
@@ -114,7 +118,8 @@ class DualWindows:
         self.root.mainloop()
 
 # -------- pipeline principal --------
-async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float, max_spread_bps: float):
+async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float,
+                         max_spread_bps: float):
     qlog("[INFO] Iniciando snapshot de mercados…")
     instances = {}
     for ex_id in exchanges:
@@ -139,7 +144,12 @@ async def build_snapshot(exchanges: list, quotes: set, topk: int, min_qv: float,
         finally:
             try: await ex.close()
             except Exception: pass
-    qlog("[INFO] Snapshot completado.")
+    if not ranked_all:
+        qlog("[INFO] Snapshot completado sin candidatos.")
+        return []
+
+    ranked_all = await sync_rankings_with_ws(ranked_all)
+    qlog(f"[INFO] Snapshot completado con {len(ranked_all)} filas tras datos en vivo.")
     return ranked_all
 
 async def main_async(args, ui: DualWindows | None = None):
@@ -158,13 +168,19 @@ async def main_async(args, ui: DualWindows | None = None):
     qlog(f"Filtros: min_net_bps: {min_net_bps} | slippage_bps: {slippage_bps}")
 
     loop = asyncio.get_running_loop()
-    await initialize_data_hub(loop, exchanges, quotes)
+    await initialize_data_hub(loop, exchanges, quotes, args.ws_top)
 
     try:
         while True:
             t0 = time.time()
             qlog("===== NUEVA PASADA =====")
-            ranked = await build_snapshot(exchanges, quotes, topk, min_qv, max_spread_bps)
+            ranked = await build_snapshot(
+                exchanges,
+                quotes,
+                topk,
+                min_qv,
+                max_spread_bps,
+            )
             if not ranked:
                 qlog("Sin candidatos tras ranking. Revisa filtros o conectividad.")
                 if refresh <= 0: break
@@ -204,6 +220,8 @@ def parse_args():
     p.add_argument('--max-spread-bps', type=float, default=50.0, help='Spread máximo en bps')
     p.add_argument('--min-net-bps', type=float, default=5.0, help='Umbral de edge neto en bps')
     p.add_argument('--slippage-bps', type=float, default=2.0, help='Slippage estimado (bps)')
+    p.add_argument('--ws-top', type=int, default=DEFAULT_WS_TOP,
+                   help='Máximo de pares totales para abrir websockets (top-M global)')
     p.add_argument('--top-show', type=int, default=20, help='Filas a mostrar en modo texto')
     p.add_argument('--save-csv', action='store_true', help='Guardar CSV de ranked y opps')
     p.add_argument('--refresh', type=float, default=0.0, help='Segundos entre pasadas (0 = solo una)')

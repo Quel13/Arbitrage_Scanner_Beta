@@ -1,252 +1,252 @@
+# io_exchanges.py
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
-import aiohttp
+import ccxt.async_support as ccxt_async
+import ccxtpro
 
-from .utils import is_spot_usual, qlog, quote_of, now_ts_ms
-from .feeds.binance_ws import ExchangeWS as BinanceWS
-from .feeds.bybit_ws import ExchangeWS as BybitWS
-from .feeds.bitget_ws import ExchangeWS as BitgetWS
+from .utils import compute_spread_bps, is_spot_usual, now_ts_ms, qlog
 
 
-FEED_FACTORIES = {
-    "binance": BinanceWS,
-    "bybit": BybitWS,
-    "bitget": BitgetWS,
-}
+class _ProFeed:
+    """Supervisa las subscripciones CCXT Pro por exchange."""
 
+    def __init__(self, loop: asyncio.AbstractEventLoop, exchange_id: str):
+        self.loop = loop
+        self.exchange_id = exchange_id
+        self.exchange: Optional[ccxtpro.Exchange] = None
+        self._running = False
+        self._symbols: set[str] = set()
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self.cache: Dict[str, dict] = {}
+        self._lock = asyncio.Lock()
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[dict] = None) -> dict:
-    try:
-        async with session.get(url, params=params, timeout=15) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    except Exception as exc:
-        qlog(f"[WARN] fallo al obtener {url}: {exc}")
-        return {}
+    async def start(self):
+        if self.exchange is None:
+            cls = getattr(ccxtpro, self.exchange_id)
+            self.exchange = cls({
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+                "newUpdates": True,
+            })
+            await self.exchange.load_markets()
+        self._running = True
 
+    async def stop(self):
+        self._running = False
+        for task in list(self._tasks.values()):
+            task.cancel()
+        for task in list(self._tasks.values()):
+            try:
+                await task
+            except Exception:
+                pass
+        self._tasks.clear()
+        self._symbols.clear()
+        if self.exchange is not None:
+            try:
+                await self.exchange.close()
+            except Exception:
+                pass
+            self.exchange = None
 
-async def _fetch_binance_markets(session: aiohttp.ClientSession) -> Dict[str, dict]:
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-    data = await _fetch_json(session, url, params={"permissions": "SPOT"})
-    symbols = {}
-    for sym in data.get("symbols", []):
-        if sym.get("status") != "TRADING":
-            continue
-        if not sym.get("isSpotTradingAllowed", True):
-            continue
-        base = sym.get("baseAsset")
-        quote = sym.get("quoteAsset")
-        if not base or not quote:
-            continue
-        symbol = f"{base}/{quote}"
-        symbols[symbol] = {"symbol": symbol, "spot": True, "active": True}
-    return symbols
+    async def set_symbols(self, symbols: Iterable[str]):
+        await self.start()
+        new_symbols = set(symbols)
+        async with self._lock:
+            to_add = new_symbols - self._symbols
+            to_remove = self._symbols - new_symbols
+            self._symbols = new_symbols
 
+            for sym in to_remove:
+                task = self._tasks.pop(sym, None)
+                if task:
+                    task.cancel()
+                self.cache.pop(sym, None)
 
-async def _fetch_bybit_markets(session: aiohttp.ClientSession) -> Dict[str, dict]:
-    url = "https://api.bybit.com/v5/market/instruments-info"
-    symbols: Dict[str, dict] = {}
-    cursor: Optional[str] = None
-    while True:
-        params = {"category": "spot"}
-        if cursor:
-            params["cursor"] = cursor
-        data = await _fetch_json(session, url, params=params)
-        result = data.get("result", {})
-        for item in result.get("list", []):
-            if item.get("status") not in ("Trading", "1"):
-                continue
-            base = item.get("baseCoin")
-            quote = item.get("quoteCoin")
-            if not base or not quote:
-                continue
-            symbol = f"{base}/{quote}"
-            symbols[symbol] = {"symbol": symbol, "spot": True, "active": True}
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-    return symbols
+            for sym in to_add:
+                self._tasks[sym] = self.loop.create_task(self._symbol_loop(sym))
 
-
-async def _fetch_bitget_markets(session: aiohttp.ClientSession) -> Dict[str, dict]:
-    url = "https://api.bitget.com/api/spot/v1/public/products"
-    data = await _fetch_json(session, url)
-    symbols: Dict[str, dict] = {}
-    for item in data.get("data", []):
-        if item.get("status") not in ("online", "1"):
-            continue
-        base = item.get("baseCoin") or item.get("baseCoinName") or item.get("base")
-        quote = item.get("quoteCoin") or item.get("quoteCoinName") or item.get("quote")
-        if not base or not quote:
-            continue
-        symbol = f"{base}/{quote}"
-        symbols[symbol] = {"symbol": symbol, "spot": True, "active": True}
-    return symbols
-
-
-MARKET_LOADERS = {
-    "binance": _fetch_binance_markets,
-    "bybit": _fetch_bybit_markets,
-    "bitget": _fetch_bitget_markets,
-}
-
-
-class ExchangeHandle:
-    def __init__(self, hub: "DataHub", exchange_id: str):
-        self.id = exchange_id
-        self._hub = hub
-
-    async def close(self):
-        # La conexión permanece viva en DataHub; aquí no se hace nada.
-        return
+    async def _symbol_loop(self, symbol: str):
+        assert self.exchange is not None
+        backoff = 1.0
+        while self._running and symbol in self._symbols:
+            try:
+                ticker = await self.exchange.watch_ticker(symbol)
+                if not ticker:
+                    continue
+                bid = ticker.get("bid")
+                ask = ticker.get("ask")
+                last = ticker.get("last") or ticker.get("close")
+                qv_raw = ticker.get("quoteVolume") or ticker.get("info", {}).get("q")
+                qv = None
+                if qv_raw is not None:
+                    try:
+                        qv = float(qv_raw)
+                    except (TypeError, ValueError):
+                        qv = None
+                ts = ticker.get("timestamp")
+                if ts is None:
+                    ts = ticker.get("info", {}).get("E") or ticker.get("info", {}).get("ts")
+                if ts is None and self.exchange is not None:
+                    ts = self.exchange.milliseconds()
+                self.cache[symbol] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "last": last,
+                    "quoteVolume": qv,
+                    "timestamp": float(ts) if ts is not None else now_ts_ms(),
+                }
+                backoff = 1.0
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                qlog(f"[WARN] WS {self.exchange_id}:{symbol} -> {exc}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
 
 class DataHub:
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop: asyncio.AbstractEventLoop, max_pairs: int = 200, max_age_ms: int = 2500):
         self.loop = loop
-        self._feeds: Dict[str, object] = {}
-        self._raw_markets: Dict[str, Dict[str, dict]] = {}
-        self._filtered_markets: Dict[str, Dict[str, dict]] = {}
-        self._symbols: Dict[str, List[str]] = {}
-        self._cache: Dict[str, Dict[str, dict]] = {}
-        self.quotes: set[str] = set()
+        self.max_pairs = max_pairs
+        self.max_age_ms = max_age_ms
+        self._feeds: Dict[str, _ProFeed] = {}
+        self._stale: Dict[str, set[str]] = {}
+        self._rest_orderbooks: Dict[str, ccxt_async.Exchange] = {}
+        self._rest_lock = asyncio.Lock()
 
-    async def update_targets(self, exchanges: List[str], quotes: set[str]):
+    async def configure(self, exchanges: Iterable[str]):
         target = set(exchanges)
-        new_quotes = set(q.upper() for q in (quotes or set()))
-        quotes_changed = new_quotes != self.quotes
-        self.quotes = new_quotes
-
-        async with aiohttp.ClientSession() as session:
-            for ex in target:
-                if ex in self._raw_markets:
-                    continue
-                loader = MARKET_LOADERS.get(ex)
-                if not loader:
-                    qlog(f"[WARN] No hay loader de mercados para {ex}")
-                    continue
-                markets = await loader(session)
-                self._raw_markets[ex] = markets
-
-        # eliminar exchanges que ya no se usan
-        for ex in list(self._feeds.keys()):
-            if ex not in target:
-                feed = self._feeds.pop(ex)
-                try:
-                    await feed.stop()
-                except Exception:
-                    pass
-                self._raw_markets.pop(ex, None)
-                self._filtered_markets.pop(ex, None)
-                self._symbols.pop(ex, None)
-                self._cache.pop(ex, None)
-
-        # preparar feeds para los target
-        for ex in target:
-            await self._ensure_feed(ex, force=quotes_changed)
-
-    async def _ensure_feed(self, exchange_id: str, force: bool = False):
-        loader = FEED_FACTORIES.get(exchange_id)
-        if not loader:
-            qlog(f"[WARN] Exchange no soportado por WS: {exchange_id}")
-            return
-        raw_markets = self._raw_markets.get(exchange_id, {})
-        if not raw_markets:
-            qlog(f"[WARN] No hay mercados para {exchange_id}")
-            return
-
-        filtered = {
-            sym: info
-            for sym, info in raw_markets.items()
-            if info.get("active", True) and is_spot_usual(info) and (not self.quotes or quote_of(sym) in self.quotes)
-        }
-        self._filtered_markets[exchange_id] = filtered
-        symbols = sorted(filtered.keys())
-
-        current_symbols = self._symbols.get(exchange_id)
-        feed = self._feeds.get(exchange_id)
-        if not symbols:
-            if feed:
+        # remove unused
+        for ex_id in list(self._feeds.keys()):
+            if ex_id not in target:
+                feed = self._feeds.pop(ex_id)
                 await feed.stop()
-                self._feeds.pop(exchange_id, None)
-            self._symbols.pop(exchange_id, None)
-            self._cache.pop(exchange_id, None)
-            return
+                self._stale.pop(ex_id, None)
+        # add new
+        for ex_id in target:
+            if ex_id not in self._feeds:
+                self._feeds[ex_id] = _ProFeed(self.loop, ex_id)
 
-        if feed and not force and current_symbols == symbols:
-            return
+    async def update_from_rankings(self, ranked_rows: List[dict]) -> List[dict]:
+        # determina top-M global y ajusta subscripciones
+        sorted_rows = sorted(ranked_rows, key=lambda r: r.get("score", 0.0), reverse=True)
+        limited = sorted_rows[: self.max_pairs]
+        targets: Dict[str, List[str]] = {}
+        for row in limited:
+            targets.setdefault(row['exchange'], []).append(row['symbol'])
 
-        if feed:
-            try:
-                await feed.stop()
-            except Exception:
-                pass
+        await asyncio.gather(*[
+            self._feeds[ex_id].set_symbols(symbols)
+            for ex_id, symbols in targets.items()
+            if ex_id in self._feeds
+        ])
 
-        handler = self._make_handler(exchange_id)
-        feed_instance = loader(self.loop, symbols, handler)
-        self._feeds[exchange_id] = feed_instance
-        self._symbols[exchange_id] = symbols
-        cache = self._cache.setdefault(exchange_id, {})
-        for obsolete in [s for s in cache if s not in symbols]:
-            cache.pop(obsolete, None)
-        await feed_instance.start()
+        # exchanges sin símbolos -> limpiar
+        empty = [ex_id for ex_id in self._feeds if ex_id not in targets]
+        for ex_id in empty:
+            await self._feeds[ex_id].set_symbols([])
 
-    def _make_handler(self, exchange_id: str):
-        def handler(symbol: str, data: dict):
-            cache = self._cache.setdefault(exchange_id, {})
-            cache[symbol] = data
-        return handler
+        snapshots = {ex_id: self.snapshot_for(ex_id) for ex_id in self._feeds}
+        enriched: List[dict] = []
+        for row in ranked_rows:
+            ex_id = row['exchange']
+            sym = row['symbol']
+            ws_data = snapshots.get(ex_id, {}).get(sym)
+            new_row = dict(row)
+            if ws_data:
+                if ws_data.get('bid') is not None:
+                    new_row['bid'] = ws_data['bid']
+                if ws_data.get('ask') is not None:
+                    new_row['ask'] = ws_data['ask']
+                if ws_data.get('quoteVolume') is not None:
+                    new_row['quote_volume'] = ws_data['quoteVolume']
+                new_row['last'] = ws_data.get('last')
+                new_row['ws_timestamp'] = ws_data.get('timestamp')
+                new_row['stale'] = False
+            else:
+                new_row['stale'] = True
 
-    async def close(self):
-        for feed in list(self._feeds.values()):
-            try:
-                await feed.stop()
-            except Exception:
-                pass
-        self._feeds.clear()
+            spread = compute_spread_bps(new_row.get('bid'), new_row.get('ask'))
+            if spread is None:
+                continue
+            new_row['spread_bps'] = spread
+            qv = new_row.get('quote_volume')
+            if isinstance(qv, (int, float)):
+                new_row['score'] = float(qv) / max(spread, 1e-6)
+            enriched.append(new_row)
+        return enriched
 
     def snapshot_for(self, exchange_id: str) -> Dict[str, dict]:
+        feed = self._feeds.get(exchange_id)
+        if not feed:
+            return {}
         now = now_ts_ms()
-        cache = self._cache.get(exchange_id, {})
-        result = {}
-        for sym, data in cache.items():
-            ts = data.get("timestamp")
+        stale_prev = self._stale.get(exchange_id, set())
+        fresh: Dict[str, dict] = {}
+        stale_now: set[str] = set()
+        for sym, data in feed.cache.items():
+            ts = data.get('timestamp')
             try:
                 ts_val = float(ts)
             except (TypeError, ValueError):
+                ts_val = 0.0
+            if ts_val <= 0 or now - ts_val > self.max_age_ms:
+                stale_now.add(sym)
                 continue
-            if now - ts_val > 1500:
-                continue
-            result[sym] = data.copy()
-        return result
+            fresh[sym] = dict(data)
+        became = stale_now - stale_prev
+        recovered = stale_prev - stale_now
+        if became:
+            qlog(f"[{exchange_id}] STALE: {', '.join(sorted(became))}")
+        if recovered:
+            qlog(f"[{exchange_id}] recuperados: {', '.join(sorted(recovered))}")
+        self._stale[exchange_id] = stale_now
+        return fresh
 
-    def markets_for(self, exchange_id: str) -> Dict[str, dict]:
-        return self._filtered_markets.get(exchange_id, {})
+    def is_stale(self, exchange_id: str, symbol: str) -> bool:
+        return symbol in self._stale.get(exchange_id, set())
 
-    def top_of_book(self, exchange_id: str, symbol: str) -> Optional[dict]:
-        data = self._cache.get(exchange_id, {}).get(symbol)
-        if not data:
+    async def close(self):
+        for feed in list(self._feeds.values()):
+            await feed.stop()
+        self._feeds.clear()
+        self._stale.clear()
+        for client in list(self._rest_orderbooks.values()):
+            try:
+                await client.close()
+            except Exception:
+                pass
+        self._rest_orderbooks.clear()
+
+    async def fetch_order_book(self, exchange_id: str, symbol: str, limit: int = 20):
+        async with self._rest_lock:
+            client = self._rest_orderbooks.get(exchange_id)
+            if client is None:
+                cls = getattr(ccxt_async, exchange_id)
+                client = cls({
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "spot"},
+                })
+                await client.load_markets()
+                self._rest_orderbooks[exchange_id] = client
+        try:
+            return await client.fetch_order_book(symbol, limit=limit)
+        except Exception as exc:
+            qlog(f"[WARN] orderbook {exchange_id}:{symbol} -> {exc}")
             return None
-        bid = data.get("bid")
-        ask = data.get("ask")
-        if bid is None or ask is None:
-            return None
-        return {
-            "bids": [(bid, 1.0)],
-            "asks": [(ask, 1.0)],
-            "timestamp": data.get("timestamp"),
-        }
 
 
-_hub: DataHub | None = None
+_hub: Optional[DataHub] = None
 
 
-async def initialize_data_hub(loop: asyncio.AbstractEventLoop, exchanges: List[str], quotes: set[str]):
+async def initialize_data_hub(loop: asyncio.AbstractEventLoop, exchanges: List[str],
+                              quotes: set[str], ws_top: int) -> DataHub:
     global _hub
     if _hub is None:
-        _hub = DataHub(loop)
-    await _hub.update_targets(exchanges, quotes)
+        _hub = DataHub(loop, max_pairs=ws_top)
+    await _hub.configure(exchanges)
     return _hub
 
 
@@ -263,22 +263,50 @@ async def shutdown_data_hub():
         _hub = None
 
 
-async def create_exchange(exchange_id: str) -> ExchangeHandle:
-    hub = get_data_hub()
-    await hub._ensure_feed(exchange_id)
-    return ExchangeHandle(hub, exchange_id)
+async def create_exchange(exchange_id: str):
+    cls = getattr(ccxt_async, exchange_id)
+    inst = cls({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+    return inst
 
 
-async def load_markets_safe(ex: ExchangeHandle):
-    hub = get_data_hub()
-    return hub.markets_for(ex.id)
+async def load_markets_safe(ex):
+    try:
+        markets = await ex.load_markets()
+    except Exception as exc:
+        qlog(f"[WARN] load_markets {ex.id}: {exc}")
+        return {}
+    return {
+        sym: info
+        for sym, info in markets.items()
+        if is_spot_usual(info)
+    }
 
 
-async def fetch_tickers_safe(ex: ExchangeHandle):
-    hub = get_data_hub()
-    return hub.snapshot_for(ex.id)
+async def fetch_tickers_safe(ex) -> Dict[str, dict]:
+    try:
+        if ex.has.get('fetchTickers'):
+            tickers = await ex.fetch_tickers()
+        else:
+            tickers = {}
+            for sym in ex.symbols:
+                try:
+                    tickers[sym] = await ex.fetch_ticker(sym)
+                except Exception:
+                    continue
+    except Exception as exc:
+        qlog(f"[WARN] fetch_tickers {ex.id}: {exc}")
+        return {}
+    return tickers
 
 
 async def fetch_order_book_once(ex_id: str, symbol: str, limit: int = 20):
     hub = get_data_hub()
-    return hub.top_of_book(ex_id, symbol)
+    return await hub.fetch_order_book(ex_id, symbol, limit=limit)
+
+
+async def sync_rankings_with_ws(ranked_rows: List[dict]) -> List[dict]:
+    hub = get_data_hub()
+    return await hub.update_from_rankings(ranked_rows)

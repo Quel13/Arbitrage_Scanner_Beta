@@ -1,6 +1,9 @@
 # config.py
 DEFAULT_EXCHANGES = ["binance", "bitget", "bybit"]
 
+# Número máximo de pares totales a los que se abrirá websocket (top-M global).
+DEFAULT_WS_TOP = 200
+
 # Fees taker (basis points). Ajusta a tu cuenta/nivel.
 TAKER_FEES_BPS = {
     "binance": 10.0, "bitget": 10.0, "bitrue": 10.0, "bybit": 10.0,
@@ -9,3 +12,4 @@ TAKER_FEES_BPS = {
 
 # Excluir tokens apalancados/raros que distorsionan el screener
 EXCLUDE_PATTERNS = ("3L", "3S", "5L", "5S", "BULL", "BEAR", "UP/", "DOWN/", "-UP/", "-DOWN/")
+

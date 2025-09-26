@@ -32,6 +32,7 @@ def rank_pairs_for_exchange(exchange_id: str, tickers: dict, quotes: set,
         rows.append({
             'exchange': exchange_id, 'symbol': nsym, 'bid': bid, 'ask': ask,
             'spread_bps': sp, 'quote_volume': qv, 'score': score,
+            'stale': False,
         })
     rows.sort(key=lambda r: r['score'], reverse=True)
     return rows[:topk]
@@ -106,8 +107,8 @@ async def compute_opportunities(
     for sym, rows in by_symbol.items():
         if len(rows) < 2:
             continue
-        buys = [r for r in rows if r.get('ask') is not None]
-        sells = [r for r in rows if r.get('bid') is not None]
+        buys = [r for r in rows if r.get('ask') is not None and not r.get('stale')]
+        sells = [r for r in rows if r.get('bid') is not None and not r.get('stale')]
         if not buys or not sells:
             continue
         buys.sort(key=lambda r: r['ask'] if r['ask'] is not None else math.inf)
